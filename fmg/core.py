@@ -89,11 +89,21 @@ class FastMemoryGraphics(AbstractSlide):
         self._mode = mode
         if mode == 'r':
             self._osr = json.load(open(filename))
-            self._data = [lmdb.open(os.path.join(self._filename[:-4], 'level' + str(i)))
+            self._data = [lmdb.open(os.path.join(self._filename[:-4], 'level' + str(i))).begin()
                           for i in range(self.level_count)]
+            # self.check_data()
         elif mode == 'w':
-
             pass
+
+    # def check_data(self):
+    #     for i in range(self.level_count):
+    #         txn = self._data[i].begin()
+    #         dimension = txn.get(key='dimension'.encode())
+    #         if dimension is not None:
+    #             dimension_w = dimension.decode()
+    #             dimension_r = str(self.level_dimensions[i])
+    #             if dimension_r != dimension_w:
+    #                 print('warning: read size %s does not match write size %s' % (dimension_w, dimension_r))
 
     def __repr__(self):
         return f'{self.__class__.__name__}({self._filename!r})'
@@ -130,6 +140,7 @@ class FastMemoryGraphics(AbstractSlide):
         return self._osr
 
     def read_region(self, location, level, size):
+
         """Return a PIL.Image containing the contents of the region.
 
         location: (x, y) tuple giving the top left pixel in the level 0
@@ -139,16 +150,17 @@ class FastMemoryGraphics(AbstractSlide):
 
         Unlike in the C interface, the image data returned by this
         function is not premultiplied."""
+        assert self._mode == 'r', 'must be in read mode!'
         x_start, y_start = location
         x_end, y_end = x_start + size[0], y_start + size[1]
         dimension = self.level_dimensions[level]
         step = self._osr['patch_size']
-        x_min = math.floor(x_start / self._osr['patch_size']) * self._osr['patch_size']
-        y_min = math.floor(y_start / self._osr['patch_size']) * self._osr['patch_size']
-        x_max = math.ceil(x_end / self._osr['patch_size']) * self._osr['patch_size']
-        y_max = math.ceil(y_end / self._osr['patch_size']) * self._osr['patch_size']
+        x_min = math.floor(x_start / step) * step
+        y_min = math.floor(y_start / step) * step
+        x_max = math.ceil(x_end / step) * step
+        y_max = math.ceil(y_end / step) * step
         image = np.zeros((y_max - y_min, x_max - x_min, 3), dtype=np.uint8)
-        txn = self._data[level].begin()
+        txn = self._data[level]
         for w in range(x_min, min(x_max, dimension[0]), step):
             for h in range(y_min, min(y_max, dimension[1]), step):
                 w_max = min(w + step, dimension[0])
@@ -161,13 +173,13 @@ class FastMemoryGraphics(AbstractSlide):
         return Image.fromarray(image)
 
     def save_from_numpy(self, data, ext='.jpg',
-                        params=[cv2.IMWRITE_JPEG_QUALITY, 85],
+                        params=[cv2.IMWRITE_JPEG_QUALITY, 90],
                         pyramid=False, mpp=None, patch_size=256):
         assert self._mode == 'w'
         w, h, c = data.shape
         level_count = 1
-        level_dimensions = [(h, w)]
-        level_downsamples = [(1.0, 1.0)]
+        level_dimensions = [[h, w]]
+        level_downsamples = [[1.0, 1.0]]
         level_data = [data]
         if pyramid:
             level_dimension = [h, w]
@@ -178,8 +190,8 @@ class FastMemoryGraphics(AbstractSlide):
                     level_dimension[0] = level_dimension[0] // 2
                     level_dimension[1] = level_dimension[1] // 2
                     level_count += 1
-                    level_downsamples.append((h / level_dimension[0], w / level_dimension[1]))
-                    level_dimensions.append((level_dimension[0], level_dimension[1]))
+                    level_downsamples.append([h / level_dimension[0], w / level_dimension[1]])
+                    level_dimensions.append([level_dimension[0], level_dimension[1]])
                     level_data.append(level_data[-1][::2, ::2, :])
 
         properties = {}
@@ -187,7 +199,7 @@ class FastMemoryGraphics(AbstractSlide):
         properties['level_dimensions'] = level_dimensions
         properties['dimension'] = level_dimensions[0]
         properties['level_downsamples'] = level_downsamples
-        properties['mpp'] = mpp
+        properties['mpp'] = float(mpp)
         properties['ext'] = ext
         properties['params'] = params
         properties['patch_size'] = patch_size
@@ -199,6 +211,11 @@ class FastMemoryGraphics(AbstractSlide):
         for i in range(level_count):
             self._data.append(lmdb.open(os.path.join(self._filename[:-4], 'level' + str(i)), map_size=1099511627776))
         for i, dimension in enumerate(level_dimensions):
+            txn = self._data[i].begin(write=True)
+            txn.put(key='patch_size'.encode(), value=str(patch_size).encode())
+            txn.put(key='mpp'.encode(), value=str(mpp).encode())
+            txn.put(key='dimension'.encode(), value=str(dimension).encode())
+            txn.commit()
             for x in range(0, dimension[0], patch_size):
                 patches = []
                 locations = []
