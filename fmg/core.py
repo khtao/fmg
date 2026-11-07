@@ -25,6 +25,17 @@ Concurrency contract
 * Within one process, all slides pointing at the same directory share one
   refcounted read-only Environment: py-lmdb refuses to open the same path
   twice, and unpickling a slide in its parent process would otherwise fail.
+
+OpenSlide compatibility
+-----------------------
+``FastMemoryGraphics`` implements the ``openslide.AbstractSlide`` interface:
+``dimensions`` / ``level_dimensions`` / ``level_downsamples`` (tuples),
+``properties`` / ``associated_images`` (mappings), ``read_region``,
+``get_best_level_for_downsample``, ``get_thumbnail``, ``set_cache``,
+``color_profile``, ``detect_format``, ``close`` and the context manager.
+``fmg.from_openslide()`` converts any OpenSlide slide (or an object with the
+same interface) into an .fmg; see ``verify_openslide_compat.py`` for the
+coordinate / pixel-content conformance check.
 """
 from __future__ import annotations
 
@@ -35,15 +46,68 @@ import shutil
 import threading
 import warnings
 from collections import OrderedDict
+from collections.abc import Mapping
 
 import cv2
 import lmdb
 import numpy as np
 from PIL import Image
 
+# ---------------------------------------------------------------------------
+# OpenSlide-compatible exception hierarchy.
+#
+# openslide is an OPTIONAL dependency (only needed by from_openslide()).
+# When it is installed we derive from its *real* exception classes, so generic
+# code written as ``except openslide.OpenSlideError`` also catches fmg errors.
+# ---------------------------------------------------------------------------
+try:
+    from openslide.lowlevel import (
+        OpenSlideError as OpenSlideError,
+        OpenSlideUnsupportedFormatError as OpenSlideUnsupportedFormatError,
+    )
+    _HAS_OPENSLIDE = True
+except Exception:                       # pragma: no cover - optional dep
+    _HAS_OPENSLIDE = False
+
+    class OpenSlideError(Exception):
+        """An error produced while reading a slide (OpenSlide-compatible)."""
+
+    class OpenSlideUnsupportedFormatError(OpenSlideError):
+        """The file is not a recognised slide format."""
+
+
+class FmgError(OpenSlideError):
+    """Base exception for this package."""
+
+
+class CorruptTileError(FmgError):
+    """A tile is missing, empty or cannot be decoded."""
+
+
+# Known-property names, mirroring openslide.PROPERTY_NAME_*.
+PROPERTY_NAME_BACKGROUND_COLOR = 'openslide.background-color'
+PROPERTY_NAME_BARCODE = 'openslide.barcode'
+PROPERTY_NAME_BOUNDS_HEIGHT = 'openslide.bounds-height'
+PROPERTY_NAME_BOUNDS_WIDTH = 'openslide.bounds-width'
+PROPERTY_NAME_BOUNDS_X = 'openslide.bounds-x'
+PROPERTY_NAME_BOUNDS_Y = 'openslide.bounds-y'
+PROPERTY_NAME_COMMENT = 'openslide.comment'
+PROPERTY_NAME_MPP_X = 'openslide.mpp-x'
+PROPERTY_NAME_MPP_Y = 'openslide.mpp-y'
+PROPERTY_NAME_OBJECTIVE_POWER = 'openslide.objective-power'
+PROPERTY_NAME_QUICKHASH1 = 'openslide.quickhash-1'
+PROPERTY_NAME_VENDOR = 'openslide.vendor'
+
 __all__ = [
-    'FmgError', 'CorruptTileError', 'AbstractSlide',
-    'FastMemoryGraphics', 'configure', 'FORMAT_VERSION',
+    'FmgError', 'CorruptTileError', 'OpenSlideError',
+    'OpenSlideUnsupportedFormatError', 'AbstractSlide',
+    'FastMemoryGraphics', 'configure', 'detect_format', 'from_openslide',
+    'FORMAT_VERSION', 'PROPERTY_NAME_BACKGROUND_COLOR', 'PROPERTY_NAME_BARCODE',
+    'PROPERTY_NAME_BOUNDS_HEIGHT', 'PROPERTY_NAME_BOUNDS_WIDTH',
+    'PROPERTY_NAME_BOUNDS_X', 'PROPERTY_NAME_BOUNDS_Y', 'PROPERTY_NAME_COMMENT',
+    'PROPERTY_NAME_MPP_X', 'PROPERTY_NAME_MPP_Y',
+    'PROPERTY_NAME_OBJECTIVE_POWER', 'PROPERTY_NAME_QUICKHASH1',
+    'PROPERTY_NAME_VENDOR',
 ]
 
 FORMAT_VERSION = 2
@@ -56,6 +120,45 @@ MIN_WRITE_MAP_SIZE = 1 << 28       # 256 MiB
 MAX_WRITE_MAP_SIZE = 1 << 40       # 1 TiB, same as the original writer
 DEFAULT_COMMIT_EVERY = 2048
 SUPPORTED_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'}
+# Above this size a source level is read in blocks instead of as one image.
+DEFAULT_MAX_LEVEL_BYTES = 256 << 20
+
+
+def _level_coord(x0, downsample):
+    """Convert a level-0 coordinate into a level coordinate, OpenSlide-style.
+
+    OpenSlide's C code assigns ``x / downsample`` (a double) to an ``int64_t``,
+    which truncates toward zero.  ``round()`` is WRONG: with an integer
+    downsample of 4 and x0=6 the correct answer is 1, not 2.  Truncation also
+    makes negative coordinates behave like OpenSlide's ``read_region_area``:
+    ``int(-4.56) == -4 == -trunc(4.56)``, so the transparent/black prefix has
+    exactly the same width.
+    """
+    return int(x0 / downsample)
+
+
+class _AssociatedImageMap(Mapping):
+    """Lazy read-only ``name -> PIL.Image`` mapping (OpenSlide-compatible)."""
+
+    def __init__(self, directory, names):
+        self._directory = directory
+        self._names = tuple(names)
+
+    def __len__(self):
+        return len(self._names)
+
+    def __iter__(self):
+        return iter(self._names)
+
+    def __getitem__(self, key):
+        if key not in self._names:
+            raise KeyError(key)
+        path = os.path.join(self._directory, str(key) + '.png')
+        with Image.open(path) as im:
+            return im.convert('RGBA')
+
+    def __repr__(self):
+        return '<_AssociatedImageMap %r>' % (list(self._names),)
 
 _cv2_pid = None
 _cv2_lock = threading.Lock()
@@ -188,14 +291,6 @@ def configure(num_threads=0, use_opencl=False):
     return os.getpid()
 
 
-class FmgError(Exception):
-    """Base exception for this package."""
-
-
-class CorruptTileError(FmgError):
-    """A tile is missing, empty or cannot be decoded."""
-
-
 def _tile_key(box):
     """Key format is part of the on-disk format; keep tuple repr."""
     return str(tuple(int(v) for v in box)).encode('ascii')
@@ -208,7 +303,17 @@ def _default_params(ext):
 
 
 class AbstractSlide:
-    """Minimal OpenSlide-like interface."""
+    """The same interface as ``openslide.AbstractSlide`` (1.4.x).
+
+    Everything here exists on a real OpenSlide object, so code written for
+    OpenSlide can be pointed at an fmg slide without changes.  The only
+    deliberate difference is the image mode returned by ``read_region``:
+    OpenSlide gives RGBA, fmg gives RGB by default (pass ``rgba=True`` to
+    ``fmg.open_slide`` for a drop-in RGBA result).
+    """
+
+    def __init__(self):
+        self._profile = None
 
     def __enter__(self):
         return self
@@ -216,6 +321,11 @@ class AbstractSlide:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
         return False
+
+    @classmethod
+    def detect_format(cls, filename):
+        """Return a string describing the format, or None if unrecognised."""
+        raise NotImplementedError
 
     def close(self):
         raise NotImplementedError
@@ -226,7 +336,7 @@ class AbstractSlide:
 
     @property
     def level_dimensions(self):
-        """[(width, height), ...] in level coordinates."""
+        """tuple of (width, height) tuples, one per level."""
         raise NotImplementedError
 
     @property
@@ -236,12 +346,43 @@ class AbstractSlide:
 
     @property
     def level_downsamples(self):
-        """[float, ...], one downsample factor per level."""
+        """tuple of float downsample factors, one per level."""
         raise NotImplementedError
 
     @property
     def properties(self):
+        """Mapping from OpenSlide property name to value."""
         raise NotImplementedError
+
+    @property
+    def associated_images(self):
+        """Mapping from image name to RGBA ``PIL.Image``."""
+        raise NotImplementedError
+
+    @property
+    def color_profile(self):
+        """An ICC profile object, or None if unavailable."""
+        return None
+
+    def get_best_level_for_downsample(self, downsample):
+        """Return the best level for displaying the given downsample."""
+        raise NotImplementedError
+
+    def set_cache(self, cache):
+        """Attach a tile cache.  fmg has its own LRU, so this is a no-op."""
+
+    def get_thumbnail(self, size):
+        """Return an RGB thumbnail no larger than ``size`` (w, h)."""
+        downsample = max(dim / thumb for dim, thumb in zip(self.dimensions, size))
+        level = self.get_best_level_for_downsample(downsample)
+        tile = self.read_region((0, 0), level, self.level_dimensions[level])
+        bg_color = '#' + str(self.properties.get(
+            PROPERTY_NAME_BACKGROUND_COLOR, 'ffffff')).lstrip('#')
+        thumb = Image.new('RGB', tile.size, bg_color)
+        thumb.paste(tile.convert('RGB'), None, tile.convert('RGBA'))
+        resampling = getattr(getattr(Image, 'Resampling', Image), 'LANCZOS')
+        thumb.thumbnail(size, resampling)
+        return thumb
 
     def read_region(self, location, level, size):
         """Return a PIL.Image.
@@ -256,6 +397,13 @@ class AbstractSlide:
     def save_from_numpy(self, data, ext='.jpg', params=None, pyramid=False,
                         mpp=None, patch_size=DEFAULT_PATCH_SIZE,
                         commit_every=DEFAULT_COMMIT_EVERY, map_size=None):
+        raise NotImplementedError
+
+    def save_from_openslide(self, source, ext='.png', params=None,
+                            patch_size=DEFAULT_PATCH_SIZE,
+                            commit_every=DEFAULT_COMMIT_EVERY,
+                            map_size=None, max_level_bytes=DEFAULT_MAX_LEVEL_BYTES,
+                            include_associated=True, progress=None):
         raise NotImplementedError
 
     def save_from_tiles(self, patches, locations, level, ext, params, txn=None):
@@ -281,10 +429,15 @@ class FastMemoryGraphics(AbstractSlide):
     strict : bool
         Raise ``CorruptTileError`` on a missing/broken tile instead of
         painting that tile black and warning once.
+    rgba : bool
+        Return RGBA images from ``read_region`` (OpenSlide behaviour) instead
+        of RGB.  Out-of-bounds pixels are (0, 0, 0, 0), matching OpenSlide's
+        transparent background.  Defaults to False to keep 0.4.x behaviour.
     """
 
     def __init__(self, filename, mode='r', *, patch_cache=128, map_size=None,
-                 strict=False, auto_worker_tuning=True):
+                 strict=False, auto_worker_tuning=True, rgba=False):
+        AbstractSlide.__init__(self)
         if mode not in ('r', 'w'):
             raise ValueError("mode must be 'r' or 'w'")
         self._filename = os.fspath(filename)
@@ -294,6 +447,7 @@ class FastMemoryGraphics(AbstractSlide):
         self._map_size = int(map_size) if map_size else None
         self._strict = bool(strict)
         self._auto_worker_tuning = bool(auto_worker_tuning)
+        self._rgba = bool(rgba)
 
         self._lock = threading.RLock()
         self._cache = OrderedDict()
@@ -308,6 +462,7 @@ class FastMemoryGraphics(AbstractSlide):
         self._public_dims = []       # (width, height) exposed to callers
         self._downsamples = []
         self._legacy = False
+        self._associated = ()
 
         if mode == 'r':
             self._load_metadata()
@@ -355,6 +510,7 @@ class FastMemoryGraphics(AbstractSlide):
         self._osr.setdefault('params', _default_params(self._osr['ext']))
         self._osr.setdefault('mpp', None)
         self._osr.setdefault('level_count', len(self._stored_dims))
+        self._associated = tuple(str(n) for n in self._osr.get('associated_images', ()))
 
     def __repr__(self):
         return f'{self.__class__.__name__}({self._filename!r}, mode={self._mode!r})'
@@ -365,23 +521,87 @@ class FastMemoryGraphics(AbstractSlide):
 
     @property
     def level_dimensions(self):
-        return [list(d) for d in self._public_dims]
+        """tuple of (width, height) tuples -- exactly like OpenSlide."""
+        return tuple(tuple(int(v) for v in d) for d in self._public_dims)
 
     @property
     def dimensions(self):
-        return self._public_dims[0]
+        return tuple(int(v) for v in self._public_dims[0])
 
     @property
     def level_downsamples(self):
-        return list(self._downsamples)
+        """tuple of floats -- exactly like OpenSlide."""
+        return tuple(float(v) for v in self._downsamples)
 
     @property
     def properties(self):
+        """Mapping with both ``openslide.*`` keys and fmg-private keys.
+
+        Files produced by :func:`from_openslide` also carry every property of
+        the source slide verbatim (including ``openslide.mpp-x`` etc.).
+        OpenSlide's own properties are always strings; fmg's private keys keep
+        their native JSON types for backwards compatibility.
+        """
         out = dict(self._osr)
+        out.update({k: str(v) for k, v in
+                    (self._osr.get('openslide_properties') or {}).items()})
+        w, h = self.dimensions
+        ps = self.patch_size
+        out.setdefault(PROPERTY_NAME_VENDOR, 'fmg')
+        out.setdefault('openslide.level-count', str(self.level_count))
+        for i, ((lw, lh), ds) in enumerate(zip(self.level_dimensions,
+                                               self.level_downsamples)):
+            prefix = 'openslide.level[%d].' % i
+            out.setdefault(prefix + 'downsample', str(ds))
+            out.setdefault(prefix + 'width', str(lw))
+            out.setdefault(prefix + 'height', str(lh))
+            out.setdefault(prefix + 'tile-width', str(ps))
+            out.setdefault(prefix + 'tile-height', str(ps))
+        mpp = self._osr.get('mpp')
+        if mpp is not None:
+            out.setdefault(PROPERTY_NAME_MPP_X, str(mpp))
+            out.setdefault(PROPERTY_NAME_MPP_Y, str(mpp))
         out['level_dimensions'] = self.level_dimensions
         out['dimension'] = list(self.dimensions)
         out['level_downsamples'] = self.level_downsamples
         return out
+
+    @property
+    def associated_images(self):
+        """Lazy ``name -> RGBA PIL.Image`` mapping (OpenSlide-compatible)."""
+        return _AssociatedImageMap(
+            os.path.join(self._data_dir, 'associated'), self._associated)
+
+    @property
+    def color_profile(self):
+        """fmg does not store ICC profiles; always None, as with ImageSlide."""
+        return None
+
+    @classmethod
+    def detect_format(cls, filename):
+        """Return ``'fmg'`` for a valid .fmg metadata file, else ``None``."""
+        try:
+            with open(os.fspath(filename), 'r', encoding='utf-8') as fh:
+                meta = json.load(fh)
+            if isinstance(meta, dict) and 'level_dimensions' in meta:
+                return 'fmg'
+        except (OSError, ValueError, TypeError):
+            pass
+        return None
+
+    def get_best_level_for_downsample(self, downsample):
+        """Same algorithm as ``openslide_get_best_level_for_downsample``.
+
+        C source: return 0 if ``downsample < ds[0]``; otherwise return the
+        last level whose downsample is <= the requested one.
+        """
+        ds = self.level_downsamples
+        if downsample < ds[0]:
+            return 0
+        for i in range(1, len(ds)):
+            if downsample < ds[i]:
+                return i - 1
+        return len(ds) - 1
 
     @property
     def patch_size(self):
@@ -529,28 +749,32 @@ class FastMemoryGraphics(AbstractSlide):
     def read_region(self, location, level, size):
         """Return a PIL.Image of ``size`` (width, height) in level coordinates.
 
-        ``location`` is given in the level-0 frame, as in OpenSlide.  Regions
-        outside the slide are padded with black instead of raising.
+        ``location`` is given in the **level-0** frame, exactly as in
+        OpenSlide.  Regions outside the slide are padded with black (or with
+        transparent black in ``rgba=True`` mode).  ``level`` is checked like
+        OpenSlide and negative / zero sizes raise ``OpenSlideError``.
         """
         if self._mode != 'r':
             raise FmgError('slide is open for writing, not reading')
         if not 0 <= level < self.level_count:
-            raise ValueError('level %d out of range [0, %d)' % (level, self.level_count))
+            raise OpenSlideError('Invalid level %d' % level)
         width, height = int(size[0]), int(size[1])
         if width <= 0 or height <= 0:
-            raise ValueError('size must be positive, got %r' % (size,))
+            raise OpenSlideError('Size %r must be positive' % (tuple(size),))
         x0, y0 = int(location[0]), int(location[1])
 
         env = self._ensure_open(level)
 
+        # OpenSlide C: int64_t level_x = x / l->downsample  (truncate toward 0).
         ds = self._downsamples[level]
-        lx0 = int(round(x0 / ds))
-        ly0 = int(round(y0 / ds))
+        lx0 = _level_coord(x0, ds)
+        ly0 = _level_coord(y0, ds)
         lx1, ly1 = lx0 + width, ly0 + height
 
         step = self.patch_size
         grid_x, grid_y = self._stored_dims[level]
-        out = np.zeros((height, width, 3), dtype=np.uint8)
+        channels = 4 if self._rgba else 3
+        out = np.zeros((height, width, channels), dtype=np.uint8)
 
         x_first = math.floor(lx0 / step) * step
         y_first = math.floor(ly0 / step) * step
@@ -578,13 +802,17 @@ class FastMemoryGraphics(AbstractSlide):
                         continue
                     src = tile[iy0 - ty:iy1 - ty, ix0 - tx:ix1 - tx]
                     dst = out[iy0 - ly0:iy1 - ly0, ix0 - lx0:ix1 - lx0]
-                    if src.shape != dst.shape:
+                    if src.shape[:2] != dst.shape[:2]:
                         # Damaged / mismatched legacy tile; do not crash a
                         # whole training job over one bad patch.
                         self._broken(level, box, 'tile shape %s != %s'
                                      % (src.shape, dst.shape))
                         continue
-                    dst[:] = src
+                    if self._rgba:
+                        dst[..., :3] = src
+                        dst[..., 3] = 255
+                    else:
+                        dst[:] = src
         return Image.fromarray(out)
 
     # ------------------------------------------------------------------ #
@@ -728,6 +956,235 @@ class FastMemoryGraphics(AbstractSlide):
         os.replace(tmp, self._filename)
         return properties
 
+    class _LevelTileProvider:
+        """Feed a ``read_region``-based source into the tiled writer.
+
+        A source level is read as ONE image when it fits in
+        ``max_level_bytes`` (this is exact: the fmg tile grid then equals the
+        source's level pixel grid).  Larger levels are read in aligned blocks;
+        the level-0 coordinate of a block is ``int(bx * downsample)``, which
+        is exact for integer downsamples.  See OPENSLIDE_COMPAT.md for the
+        fractional-downsample caveat.
+        """
+
+        def __init__(self, source, dims, downsamples, max_level_bytes,
+                     block_size=2048):
+            self.source = source
+            self.dims = dims
+            self.downsamples = downsamples
+            self.max_level_bytes = int(max_level_bytes)
+            self.block_size = int(block_size)
+            self._level = None
+            self._full = None
+            self._block = None
+            self._block_origin = None
+
+        def begin_level(self, level):
+            self._level = level
+            self._block = None
+            self._block_origin = None
+            gw, gh = self.dims[level]
+            if gw * gh * 4 <= self.max_level_bytes:
+                # One call, location (0, 0): no coordinate conversion at all.
+                arr = np.asarray(self.source.read_region((0, 0), level, (gw, gh)))
+                self._full = np.ascontiguousarray(arr[..., :3])
+            else:
+                self._full = None
+
+        def end_level(self, level):
+            self._full = None
+            self._block = None
+            self._block_origin = None
+
+        def _load_block(self, bx, by):
+            gw, gh = self.dims[self._level]
+            bw = min(self.block_size, gw - bx)
+            bh = min(self.block_size, gh - by)
+            ds = self.downsamples[self._level]
+            x0 = int(bx * ds)
+            y0 = int(by * ds)
+            arr = np.asarray(
+                self.source.read_region((x0, y0), self._level, (bw, bh)))
+            self._block = np.ascontiguousarray(arr[..., :3])
+            self._block_origin = (bx, by)
+
+        def __call__(self, level, x, y, x_max, y_max):
+            if self._full is not None:
+                return self._full[y:y_max, x:x_max]
+            bx = (x // self.block_size) * self.block_size
+            by = (y // self.block_size) * self.block_size
+            if self._block_origin != (bx, by):
+                self._load_block(bx, by)
+            return self._block[y - by:y_max - by, x - bx:x_max - bx]
+
+    def _write_converted(self, dims, downsamples, extra, provider, ext, params,
+                         patch_size, commit_every, map_size, associated,
+                         progress=None):
+        """Common writer for :meth:`save_from_openslide`."""
+        map_size = int(map_size) if map_size else (
+            self._map_size or self._estimate_map_size(dims))
+        map_size = max(MIN_WRITE_MAP_SIZE, map_size)
+
+        properties = {
+            'format_version': FORMAT_VERSION,
+            'map_size': map_size,
+            'grid_axes': 'xy',
+            'level_count': len(dims),
+            'level_dimensions': [list(d) for d in dims],
+            'dimension': list(dims[0]),
+            'level_downsamples': [float(d) for d in downsamples],
+            'mpp': extra.get('mpp'),
+            'ext': ext,
+            'params': params,
+            'patch_size': patch_size,
+            'channels': 3,
+            'tile_codec': 'opencv',
+        }
+        properties.update({k: v for k, v in extra.items() if k != 'mpp'})
+
+        # _write_env() reads patch_size / mpp from self._osr, so install the
+        # metadata before opening any LMDB environment.
+        self._osr = properties
+        self._stored_dims = [tuple(d) for d in dims]
+        self._public_dims = [tuple(d) for d in dims]
+        self._downsamples = [float(d) for d in downsamples]
+        self._legacy = False
+
+        if os.path.exists(self._data_dir):
+            shutil.rmtree(self._data_dir)
+        os.makedirs(self._data_dir)
+
+        if associated:
+            adir = os.path.join(self._data_dir, 'associated')
+            os.makedirs(adir)
+            names = []
+            for name, image in associated.items():
+                safe = (str(name).replace('/', '_').replace('\\', '_')
+                        .replace('..', '_'))
+                image.convert('RGBA').save(os.path.join(adir, safe + '.png'))
+                names.append(safe)
+            properties['associated_images'] = names
+            self._associated = tuple(names)
+
+        for level, (gw, gh) in enumerate(dims):
+            provider.begin_level(level)
+            env = self._write_env(level, (gw, gh), map_size)
+            try:
+                txn = env.begin(write=True)
+                written = 0
+                total = (math.ceil(gw / patch_size) * math.ceil(gh / patch_size))
+                for x in range(0, gw, patch_size):
+                    for y in range(0, gh, patch_size):
+                        x_max, y_max = min(x + patch_size, gw), min(y + patch_size, gh)
+                        arr = np.ascontiguousarray(
+                            self._as_uint8_hwc(provider(level, x, y, x_max, y_max)))
+                        ok, buff = cv2.imencode(ext, arr, params)
+                        if not ok or buff is None or buff.size == 0:
+                            raise FmgError('cv2.imencode failed for tile '
+                                           '(%d,%d,%d,%d)' % (x, y, x_max, y_max))
+                        txn.put(key=_tile_key((x, y, x_max, y_max)),
+                                value=memoryview(buff))
+                        written += 1
+                        if written % commit_every == 0:
+                            txn.commit()
+                            txn = env.begin(write=True)
+                        if progress is not None:
+                            progress(level, written, total)
+                txn.commit()
+                env.sync()
+            finally:
+                env.close()
+                provider.end_level(level)
+
+        self._osr = properties
+        self._stored_dims = [tuple(d) for d in dims]
+        self._public_dims = [tuple(d) for d in dims]
+        self._downsamples = [float(d) for d in downsamples]
+        self._legacy = False
+
+        tmp = self._filename + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(properties, fh, separators=(',', ':'))
+        os.replace(tmp, self._filename)
+        return properties
+
+    def save_from_openslide(self, source, ext='.png', params=None,
+                            patch_size=DEFAULT_PATCH_SIZE,
+                            commit_every=DEFAULT_COMMIT_EVERY,
+                            map_size=None, max_level_bytes=DEFAULT_MAX_LEVEL_BYTES,
+                            include_associated=True, progress=None):
+        """Convert an OpenSlide slide (or any AbstractSlide-like object).
+
+        ``source`` may be a path (opened with ``openslide.open_slide`` when
+        openslide is installed) or an already-open slide object.  Every level,
+        its exact ``level_dimensions`` and ``level_downsamples``, all source
+        ``properties`` and all ``associated_images`` are preserved.  The alpha
+        channel of ``read_region`` is discarded -- fmg stores RGB.
+
+        Use ``ext='.png'`` (the default) for lossless, pixel-exact conversion.
+        """
+        if self._mode != 'w':
+            raise FmgError('slide is open for reading, not writing')
+        ext = ext.lower()
+        if ext not in SUPPORTED_EXT:
+            raise ValueError('unsupported ext %r, choose from %s'
+                             % (ext, sorted(SUPPORTED_EXT)))
+        params = [int(p) for p in params] if params is not None else _default_params(ext)
+        patch_size = int(patch_size)
+        if patch_size <= 0:
+            raise ValueError('patch_size must be positive')
+
+        src, owned = _resolve_openslide_source(source)
+        try:
+            dims = tuple(tuple(int(v) for v in d)
+                         for d in src.level_dimensions)
+            downsamples = tuple(float(v) for v in src.level_downsamples)
+            if not dims or len(dims) != len(downsamples):
+                raise FmgError('source slide has inconsistent level metadata')
+            if any(w <= 0 or h <= 0 for w, h in dims):
+                raise FmgError('source slide has an empty level')
+
+            raw_props = {str(k): str(v) for k, v in src.properties.items()}
+            # Level geometry keys must describe the converted file, not the
+            # source; FastMemoryGraphics.properties regenerates them.
+            for key in list(raw_props):
+                if key == 'openslide.level-count' or key.startswith('openslide.level['):
+                    del raw_props[key]
+
+            mpp = None
+            try:
+                mpp = float(raw_props[PROPERTY_NAME_MPP_X])
+            except (KeyError, ValueError, TypeError):
+                pass
+
+            associated = {}
+            if include_associated:
+                try:
+                    associated = {str(name): src.associated_images[name]
+                                  for name in src.associated_images}
+                except Exception:      # pragma: no cover - exotic sources
+                    associated = {}
+
+            vendor = raw_props.get(PROPERTY_NAME_VENDOR)
+            extra = {
+                'mpp': mpp,
+                'openslide_properties': raw_props,
+                'source_vendor': vendor,
+                'conversion': 'openslide',
+            }
+            provider = self._LevelTileProvider(
+                src, dims, downsamples, max_level_bytes,
+                block_size=max(patch_size, 2048))
+            return self._write_converted(
+                dims, downsamples, extra, provider, ext, params, patch_size,
+                commit_every, map_size, associated, progress)
+        finally:
+            if owned:
+                try:
+                    src.close()
+                except Exception:
+                    pass
+
     def save_from_tiles(self, patches, locations, level, ext, params=None, txn=None):
         """Append tiles to ``level``.
 
@@ -755,3 +1212,62 @@ class FastMemoryGraphics(AbstractSlide):
             env.sync()
         finally:
             env.close()
+
+
+def _resolve_openslide_source(source):
+    """Accept a path, an OpenSlide object, or any AbstractSlide-like object."""
+    if isinstance(source, (str, bytes, os.PathLike)):
+        if not _HAS_OPENSLIDE:
+            raise FmgError(
+                'openslide-python (plus the OpenSlide C library) is required '
+                'to convert from a filename; pass an already-open slide '
+                'object instead, or `pip install openslide-python openslide-bin`')
+        import openslide
+        try:
+            return openslide.open_slide(os.fspath(source)), True
+        except Exception as exc:
+            raise OpenSlideUnsupportedFormatError(
+                'cannot open %r as a slide: %s' % (os.fspath(source), exc)) from exc
+    required = ('level_dimensions', 'level_downsamples', 'read_region',
+                'properties')
+    missing = [n for n in required if not hasattr(source, n)]
+    if missing:
+        raise TypeError('source does not implement AbstractSlide (missing %s)'
+                        % ', '.join(missing))
+    return source, False
+
+
+def detect_format(filename):
+    """Return ``'fmg'`` if ``filename`` is an fmg metadata file, else ``None``.
+
+    Mirrors ``openslide.OpenSlide.detect_format`` / ``openslide.detect_format``.
+    """
+    return FastMemoryGraphics.detect_format(filename)
+
+
+def from_openslide(source, filename, **kwargs):
+    """Convert an OpenSlide slide into an ``.fmg`` file.
+
+    Parameters
+    ----------
+    source : path or slide object
+        Anything accepted by ``openslide.open_slide`` (path), or an object
+        implementing the ``AbstractSlide`` interface.
+    filename : str
+        Destination ``.fmg`` path.
+    **kwargs
+        Passed to :meth:`FastMemoryGraphics.save_from_openslide` -- e.g.
+        ``ext='.png'`` (default, lossless), ``patch_size``, ``map_size``,
+        ``max_level_bytes``, ``include_associated``, ``progress``.
+
+    Returns the metadata dict that was written.
+
+    Example
+    -------
+        import fmg
+        fmg.from_openslide('slide.svs', 'slide.fmg', patch_size=256)
+        with fmg.open_slide('slide.fmg') as slide:
+            patch = slide.read_region((1000, 2000), 0, (512, 512))
+    """
+    writer = FastMemoryGraphics(os.fspath(filename), mode='w')
+    return writer.save_from_openslide(source, **kwargs)

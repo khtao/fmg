@@ -42,8 +42,10 @@ def _install_eio_retry():
     real_open = lmdb.open
 
     def retrying_open(path, **kw):
-        creating = bool(kw.get('create', False))
-        for _ in range(60):
+        # py-lmdb defaults to create=True, so treat every non-readonly open as
+        # a creating one and clear half-created files before retrying.
+        creating = not bool(kw.get('readonly', False))
+        for _ in range(200):
             try:
                 return real_open(path, **kw)
             except lmdb.Error as exc:
@@ -55,7 +57,7 @@ def _install_eio_retry():
                             os.remove(os.path.join(path, name))
                         except OSError:
                             pass
-                time.sleep(0.01)
+                time.sleep(0.02)
         raise RuntimeError('LMDB open kept failing with EIO on %s' % path)
 
     fmg.core.lmdb.open = retrying_open
@@ -131,6 +133,54 @@ def test_shared_env(img, path):
     check(np.array_equal(np.asarray(clone.read_region((100, 50), 0, (64, 64))), ref),
           'last remaining slide still reads after the others close')
     clone.close()
+
+
+def test_openslide_surface(path):
+    print('[1c] OpenSlide API surface')
+    slide = fmg.open_slide(path)
+    check(isinstance(slide.level_dimensions, tuple)
+          and all(isinstance(d, tuple) for d in slide.level_dimensions),
+          'level_dimensions is a tuple of tuples')
+    check(isinstance(slide.level_downsamples, tuple),
+          'level_downsamples is a tuple')
+    check(fmg.detect_format(path) == 'fmg', 'detect_format(.fmg) == "fmg"')
+    check(fmg.detect_format(os.path.join(BASE, 'selftest.py')) is None,
+          'detect_format(non-fmg) is None')
+    check(slide.get_best_level_for_downsample(1.5) == 0
+          and slide.get_best_level_for_downsample(2.0) == 1,
+          'get_best_level_for_downsample follows OpenSlide C semantics')
+    check('openslide.vendor' in slide.properties
+          and 'openslide.level[0].width' in slide.properties,
+          'properties exposes openslide.* keys')
+    check(len(slide.associated_images) == 0,
+          'associated_images is an empty mapping for numpy-written slides')
+    check(slide.color_profile is None, 'color_profile is None')
+    slide.set_cache(object())
+    check(True, 'set_cache is a harmless no-op')
+    thumb = slide.get_thumbnail((64, 64))
+    check(thumb.mode == 'RGB' and max(thumb.size) <= 64, 'get_thumbnail works')
+    slide.close()
+
+    rgba = fmg.open_slide(path, rgba=True)
+    img = rgba.read_region((10, 10), 0, (32, 32))
+    check(img.mode == 'RGBA', 'rgba=True returns RGBA')
+    arr = np.asarray(img)
+    check(np.all(arr[..., 3] == 255), 'in-bounds alpha is 255')
+    edge = np.asarray(rgba.read_region((W - 8, H - 8), 0, (32, 32)))
+    check(np.all(edge[8:, 8:, 3] == 0), 'out-of-bounds alpha is 0')
+    rgba.close()
+
+    try:
+        fmg.open_slide(path).read_region((0, 0), 999, (8, 8))
+        raise AssertionError('expected OpenSlideError')
+    except fmg.OpenSlideError:
+        check(True, 'invalid level raises OpenSlideError')
+    try:
+        import openslide
+        check(issubclass(fmg.FmgError, openslide.OpenSlideError),
+              'FmgError is catchable as openslide.OpenSlideError')
+    except ImportError:
+        print('  skip openslide exception hierarchy (openslide not installed)')
 
 
 def _worker(slide, queue, n, seed, img):
@@ -247,6 +297,7 @@ def main():
     print('write: %.2fs, levels=%s' % (time.time() - t0, meta['level_dimensions']))
 
     test_single_process(img, path)
+    test_openslide_surface(path)
     test_shared_env(img, path)
     test_fork(img, path)
     test_spawn(img, path)
