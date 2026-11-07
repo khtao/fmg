@@ -1,5 +1,9 @@
 # fmg
 
+[![PyPI version](https://img.shields.io/pypi/v/fmg.svg)](https://pypi.org/project/fmg/)
+[![Python versions](https://img.shields.io/pypi/pyversions/fmg.svg)](https://pypi.org/project/fmg/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 > 把超大图像切成 tile 存进 LMDB，用 OpenSlide 的方式读，然后——在 `num_workers=8` 的 DataLoader 里，忘掉它的存在。
 
 **fmg 0.4.0** · Python ≥ 3.7 · MIT · LMDB / OpenCV / NumPy / Pillow
@@ -87,14 +91,21 @@ lmdb.Error: The environment '.../level0' is already open in this process
 
 ### 安装
 
-依赖：`lmdb>=1.0`、`opencv-python>=4.0`、`numpy>=1.17`、`pillow>=7.0`。
-
 ```bash
-pip install lmdb opencv-python numpy pillow
-pip install .          # 在本项目根目录执行
+pip install fmg==0.4.0
 ```
 
-也可以直接把 `fmg/` 目录放进工程里 `import fmg`。
+从源码安装（或想跑自测 / 基准）：
+
+```bash
+git clone https://github.com/khtao/fmg.git && cd fmg
+pip install .
+python selftest.py
+```
+
+依赖会自动装上：`lmdb>=1.0`、`opencv-python>=4.0`、`numpy>=1.17`、`pillow>=7.0`。无 GUI 的服务器若装不上 `opencv-python`（缺 `libGL`），可在自己的环境里改用 `opencv-python-headless`。
+
+想给项目做一次发布？作者操作手册见 [`RELEASE.md`](https://github.com/khtao/fmg/blob/main/RELEASE.md)。
 
 ### 写入一张图
 
@@ -180,7 +191,7 @@ for batch in loader:
     ...
 ```
 
-完整可运行版本见 [`test.py`](test.py)。
+完整可运行版本见 [`test.py`](https://github.com/khtao/fmg/blob/main/test.py)。
 
 ---
 
@@ -236,7 +247,7 @@ slide/
 6. `spawn` 启动时记得在 `worker_init_fn` 里调 `fmg.configure(num_threads=0)`；`fork` 下自动处理。
 7. 覆盖写一张正在被读的 `.fmg` 时，先 `close()` 所有读句柄——`save_from_numpy` 会删除并重建底层目录。
 
-完整的根因分析、修复清单与迁移细节见 [`OPTIMIZATION.md`](OPTIMIZATION.md)。
+完整的根因分析、修复清单与迁移细节见 [`OPTIMIZATION.md`](https://github.com/khtao/fmg/blob/main/OPTIMIZATION.md)。
 
 ---
 
